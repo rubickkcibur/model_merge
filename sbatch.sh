@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -o job.%j.out
-#SBATCH --error job.%j.err
-#SBATCH -p gov
+#SBATCH -o job.%j.out.log
+#SBATCH --error job.%j.err.log
+#SBATCH -p gov-research
 #SBATCH --exclusive
 #SBATCH -J myFirstGPUJob
 #SBATCH --nodes=1

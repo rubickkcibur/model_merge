@@ -7,6 +7,8 @@ import random
 from datasets import load_dataset
 import re
 import json
+from utils import compute_metrics
+from RL_search import LearningFramework
 
 SPECIAL_MODEL_PATH = "/aifs4su/zhanqimin/LLaMA-Factory/merge_lora/"
 code_base_model_path = os.path.join(SPECIAL_MODEL_PATH, "llama3_base_codealpaca_3epoch")
@@ -17,58 +19,7 @@ def format_ground_truth_answer(ground: str):
     ground = ground.replace("####", "The answer is")
     ground = re.sub(r"<<.*?>>","",ground)
     return ground
-def build_dataset():
-    valid_dataset = load_dataset("gsm8k", "main", split="train[:32]")
-    valid_dataset = [
-        [
-            dict(role='user', content="Question: {}\nLet's think step by step\nAnswer:".format(data["question"])),
-            dict(role='assistant', content='{}'.format(format_ground_truth_answer(data["answer"]))),
-        ]
-        for data in valid_dataset
-    ]
-    return valid_dataset
 
-gsm8k_set = build_dataset()
-
-def compute_loss(model, tokenizer, prompts):
-    model.eval()
-    tokenizer.padding_side = "left"
-    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-    inputs = [
-        tokenizer.apply_chat_template(
-            m,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            tokenize=False
-        )
-        for m in prompts
-    ]
-    inputs = tokenizer(
-        inputs,
-        return_tensors="pt",
-        padding='longest',
-        truncation=True,
-        max_length=2048,
-        add_special_tokens=True).to("cuda")
-    torch.cuda.empty_cache()
-    with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-        labels = copy.deepcopy(inputs["input_ids"])
-        batch_size = logits.shape[0]
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        shift_logits = shift_logits.view(-1, model.config.vocab_size)
-        shift_labels = shift_labels.view(-1)
-        loss = loss_fct(shift_logits, shift_labels)
-        loss = loss.view(batch_size, -1)
-    mask = inputs["attention_mask"][:, 1:]
-    loss = loss * mask
-    loss = torch.sum(loss, dim=-1)
-    divider = torch.sum(mask, dim=-1)
-    loss = torch.div(loss, divider).detach().cpu().numpy()
-    avg_loss = np.mean(loss)
-    return avg_loss
 
 def merge_weight(target_model, peer_model, layer_weights):
     with torch.no_grad():
@@ -91,10 +42,6 @@ def recover_weight(target_model, peer_model, layer_weights):
                 p.data -= peer_model.state_dict()[name] * 0.5
                 p.data /= 0.5
     return
-
-def compute_metrics(model, tokenizer):
-    gsm8k_loss = compute_loss(model, tokenizer, gsm8k_set)
-    return gsm8k_loss
 
 
 def find_optimal_weights(target_model, peer_model, tokenizer, LAYER_PARTS, WEIGHT_LIST):
@@ -133,7 +80,7 @@ def find_optimal_weights(target_model, peer_model, tokenizer, LAYER_PARTS, WEIGH
             layer_weights[name] = optimal_weight
         print(loss_record)
     print(search_records)
-    with open("optimal_weights_32parts_inverse.json", "w") as f:
+    with open("optimal_weights_32parts_inverse_1000sample.json", "w") as f:
         json.dump(layer_weights, f)
 
 def merge_models(target_model, peer_model, weight_file_path, save_path):
@@ -149,6 +96,116 @@ def merge_models(target_model, peer_model, weight_file_path, save_path):
                 p.data += peer_model.state_dict()[name] * 0.5
     target_model.save_pretrained(save_path)
 
+def learn_by_RL(model_math, model_code, tokenizer, layer_num):
+    layer_names = [
+        [
+            "model.layers.{}.self_attn.q_proj.weight".format(layer_n),
+            "model.layers.{}.self_attn.k_proj.weight".format(layer_n),
+            "model.layers.{}.self_attn.v_proj.weight".format(layer_n),
+            "model.layers.{}.self_attn.o_proj.weight".format(layer_n),
+            "model.layers.{}.mlp.gate_proj.weight".format(layer_n),
+            "model.layers.{}.mlp.up_proj.weight".format(layer_n),
+            "model.layers.{}.mlp.down_proj.weight".format(layer_n),
+            "model.layers.{}.input_layernorm.weight".format(layer_n),
+            "model.layers.{}.post_attention_layernorm.weight".format(layer_n),
+        ] for layer_n in range(layer_num)
+    ]
+    env_args = {
+        "seed_state": np.random.rand(32),
+        "target_model": model_math,
+        "peer_model": model_code,
+        "layer_names": layer_names,
+        "tokenizer": tokenizer,
+        "device": "cuda:5",
+    }
+    buffer_args = {
+        "max_size": 2000
+    }
+    policy_args = {
+        "state_size": layer_num,
+        "action_size": layer_num,
+        "hidden_size": 128,
+        "actor_lr": 1e-3,
+        "critic_lr": 1e-3,
+        "gamma": 0.8
+    }
+    args = {
+        "env_args": env_args,
+        "buffer_args": buffer_args,
+        "policy_args": policy_args,
+        "max_T": 10,
+        "epochs": 20,
+        "device": "cuda:5",
+        "batch_size": 32,
+        "actor_path": "/home/rubickjiang/model_merge/RL/actor.pth",
+        "critic_path": "/home/rubickjiang/model_merge/RL/critic.pth",
+        "log_path": "/home/rubickjiang/model_merge/RL/logs"
+    }
+    lr = LearningFramework(args)
+    lr.learn()
+
+def find_weight_by_RL(model_math, model_code, tokenizer, layer_num, weight_path):
+    layer_names = [
+        [
+            "model.layers.{}.self_attn.q_proj.weight".format(layer_n),
+            "model.layers.{}.self_attn.k_proj.weight".format(layer_n),
+            "model.layers.{}.self_attn.v_proj.weight".format(layer_n),
+            "model.layers.{}.self_attn.o_proj.weight".format(layer_n),
+            "model.layers.{}.mlp.gate_proj.weight".format(layer_n),
+            "model.layers.{}.mlp.up_proj.weight".format(layer_n),
+            "model.layers.{}.mlp.down_proj.weight".format(layer_n),
+            "model.layers.{}.input_layernorm.weight".format(layer_n),
+            "model.layers.{}.post_attention_layernorm.weight".format(layer_n),
+        ] for layer_n in range(layer_num)
+    ]
+    env_args = {
+        "seed_state": np.random.rand(32),
+        "target_model": model_math,
+        "peer_model": model_code,
+        "layer_names": layer_names,
+        "tokenizer": tokenizer,
+        "device": "cuda:5",
+    }
+    buffer_args = {
+        "max_size": 2000
+    }
+    policy_args = {
+        "state_size": layer_num,
+        "action_size": layer_num,
+        "hidden_size": 128,
+        "actor_lr": 1e-3,
+        "critic_lr": 1e-3,
+        "gamma": 0.8
+    }
+    args = {
+        "env_args": env_args,
+        "buffer_args": buffer_args,
+        "policy_args": policy_args,
+        "max_T": 10,
+        "epochs": 20,
+        "device": "cuda:5",
+        "batch_size": 32,
+        "actor_path": "/home/rubickjiang/model_merge/RL/actor.pth",
+        "critic_path": "/home/rubickjiang/model_merge/RL/critic.pth",
+        "log_path": "/home/rubickjiang/model_merge/RL/logs"
+    }
+    lr = LearningFramework(args)
+    lr.load_policy(
+        actor_path = "/home/rubickjiang/model_merge/RL/actor.pth",
+        critic_path = "/home/rubickjiang/model_merge/RL/critic.pth" 
+    )
+    with open(weight_path, "r") as f:
+        layer_weights = json.load(f)
+    seed_weight = [0.5] * layer_num
+    for i in range(len(layer_names)):
+        layer_name = layer_names[i][0]
+        weight = layer_weights[layer_name]
+        seed_weight[i] = weight
+    pred_states = lr.inference(np.array(seed_weight), 10)
+    print(pred_states)
+
+
+    
 
 if __name__ == "__main__":
     seed = 114514
@@ -172,10 +229,12 @@ if __name__ == "__main__":
         model_max_length=2048,
         padding_side="left"
     )
-    model_math.cuda()
-    model_code.cuda()
+    model_math.to("cuda:5")
+    model_code.to("cuda:5")
+    learn_by_RL(model_math, model_code, tokenizer, LAYER_PARTS)
+    # find_weight_by_RL(model_math, model_code, tokenizer, LAYER_PARTS, "/home/rubickjiang/model_merge/optimal_weights_32parts_inverse.json")
     # find_optimal_weights(model_math, model_code, tokenizer, LAYER_PARTS, WEIGHT_LIST)
-    merge_models(model_math, model_code, "/home/rubickjiang/model_merge/optimal_weights_32parts_inverse.json", "/aifs4su/rubickjiang/merge_models/32parts_inverse")
+    # merge_models(model_math, model_code, "/home/rubickjiang/model_merge/optimal_weights_32parts_inverse_1000sample.json", "/aifs4su/rubickjiang/merge_models/32parts_inverse_1000sample")
 
 # with torch.no_grad():
 #     for name, p in model_math.named_parameters():

@@ -1,6 +1,6 @@
 #!/bin/bash
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-MODEL_PATH="/aifs4su/rubickjiang/merge_models/32parts_inverse"
+MODEL_PATH="/aifs4su/rubickjiang/huggingface_models/Meta-Llama-3-8B-Instruct"
 DATA_PATH=""
 DATASET_NAME="gsm8k"
 SPLIT=0
@@ -12,7 +12,7 @@ PEFT_MODEL=""
 # export CUDA_VISIBLE_DEVICES=0
 # what matters: model_name_or_path, peft_model_path, eval_data_path, per_device_eval_batch_size(fixed)
 export SEED=114514
-accelerate launch evaluation.py \
+accelerate launch --config_file "/home/rubickjiang/.cache/huggingface/accelerate/default_config_acc.yaml" evaluation.py \
   --model_name_or_path "$MODEL_PATH" \
   --peft_model_path "$PEFT_MODEL" \
   --dataset_name "$DATASET_NAME" \

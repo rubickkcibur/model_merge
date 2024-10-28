@@ -2,6 +2,9 @@ import re
 from torch.utils.data import Dataset, DataLoader
 import transformers
 import copy
+import torch
+from datasets import load_dataset
+import numpy as np
 
 ANSER_INDICATOR = "The answer is "
 gsm8k_opencompass_chat = [
@@ -317,3 +320,101 @@ class SupervisedDataset(Dataset):
             groundtruth = self.groundtruths[i],
             question = self.questions[i]
         )
+    
+
+def build_dataset(name:str):
+    if name == "gsm8k":
+        valid_dataset = load_dataset("gsm8k", "main", split="train[:25]")
+        valid_dataset = [
+            [
+                dict(role='user', content="Question: {}\nLet's think step by step\nAnswer:".format(data["question"])),
+                dict(role='assistant', content='{}'.format(format_ground_truth_answer(data["answer"]))),
+            ]
+            for data in valid_dataset
+        ]
+        return valid_dataset
+    if name == "math":
+        datasets = [
+            load_dataset("lighteval/MATH", "algebra", split="train[:5]"),
+            load_dataset("lighteval/MATH", "counting_and_probability", split="train[:5]"),
+            load_dataset("lighteval/MATH", "geometry", split="train[:5]"),
+            load_dataset("lighteval/MATH", "intermediate_algebra", split="train[:5]"),
+            load_dataset("lighteval/MATH", "number_theory", split="train[:5]"),
+            load_dataset("lighteval/MATH", "prealgebra", split="train[:5]"),
+            load_dataset("lighteval/MATH", "precalculus", split="train[:5]")
+        ]
+        valid_dataset = []
+        for ds in datasets:
+            valid_dataset += [
+                [
+                    dict(role='user', content="Question: {}\nLet's think step by step\nAnswer:".format(data["problem"])),
+                    dict(role='assistant', content='{}'.format(data["solution"])),
+                ]
+                for data in ds
+            ]
+        return valid_dataset
+    if name == "openai_humaneval":
+        dataset = load_dataset("openai/openai_humaneval", split="test[:10]")
+        valid_dataset = [
+            [
+                dict(role='user', content="Question: {}\nLet's think step by step\nAnswer:".format(data["prompt"])),
+                dict(role='assistant', content='{}'.format(data["canonical_solution"])),
+            ]
+            for data in dataset
+        ]
+        return valid_dataset
+    if name == "IFEval":
+        pass
+
+GSM8K_SET = build_dataset("gsm8k")
+MATH_SET = build_dataset("math")
+OPENAI_SET = build_dataset("openai_humaneval")
+
+
+def compute_loss(model, tokenizer, prompts, device):
+    model.eval()
+    tokenizer.padding_side = "left"
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    inputs = [
+        "\n".join([m[0]["content"], m[1]["content"]])
+        for m in prompts
+    ]
+    total_loss = []
+    i = 0
+    while i < len(inputs):
+        batch_inputs = tokenizer(
+            inputs[i:i+8],
+            # inputs,
+            return_tensors="pt",
+            padding='longest',
+            truncation=True,
+            max_length=2048,
+            add_special_tokens=True).to(device)
+        torch.cuda.empty_cache()
+        with torch.no_grad():
+            outputs = model(**batch_inputs)
+            logits = outputs.get("logits")
+            labels = copy.deepcopy(batch_inputs["input_ids"])
+            batch_size = logits.shape[0]
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_logits = shift_logits.view(-1, model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            loss = loss_fct(shift_logits, shift_labels)
+            loss = loss.view(batch_size, -1)
+        mask = batch_inputs["attention_mask"][:, 1:]
+        loss = loss * mask
+        loss = torch.sum(loss, dim=-1)
+        divider = torch.sum(mask, dim=-1)
+        loss = torch.div(loss, divider).detach().cpu().numpy()
+        avg_loss = np.mean(loss)
+        total_loss.append(avg_loss)
+        i += 8
+    return sum(total_loss)/len(total_loss)
+    # return avg_loss
+
+def compute_metrics(model, tokenizer, device="cpu"):
+    gsm8k_loss = compute_loss(model, tokenizer, GSM8K_SET, device)
+    math_loss = compute_loss(model, tokenizer, MATH_SET, device)
+    humaneval = compute_loss(model, tokenizer, OPENAI_SET, device)
+    return (gsm8k_loss + math_loss + humaneval)/3
